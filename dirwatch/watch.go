@@ -3,6 +3,7 @@ package dirwatch
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
