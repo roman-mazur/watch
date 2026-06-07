@@ -32,7 +32,7 @@ func collectWatchPaths(dir string) []string {
 		return res
 	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() && filterEntry(filepath.Base(entry.Name())) {
 			res = append(res, collectWatchPaths(filepath.Join(dir, entry.Name()))...)
 		}
 	}
@@ -54,7 +54,7 @@ func processEvents(w *fsnotify.Watcher, out chan string) {
 			}
 			if e.Has(fsnotify.Create) {
 				fi, err := os.Stat(e.Name)
-				if err == nil && fi.IsDir() {
+				if err == nil && fi.IsDir() && filterEntry(filepath.Base(e.Name)) {
 					_ = w.Add(e.Name)
 				}
 			}
@@ -70,4 +70,8 @@ func processEvents(w *fsnotify.Watcher, out chan string) {
 			}
 		}
 	}
+}
+
+func filterEntry(name string) bool {
+	return !strings.HasPrefix(name, ".")
 }
