@@ -4,4 +4,3 @@ Example:
 ```
 watch . go test ./...
 ```
-
