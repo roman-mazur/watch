@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"time"
 
 	"rmazur.io/watch/dirwatch"
 )
@@ -23,21 +24,33 @@ func main() {
 	if watchPath == "" {
 		watchPath = "."
 	}
-	logf("watching %s", watchPath)
-
-	signals := make(chan string)
-	go func() {
-		err := dirwatch.Watch(watchPath, signals)
-		if err != nil {
-			panic(err)
-		}
-	}()
-
-	args := flag.Args()[1:]
-	logf("cmd: %s", args)
-	for range signals {
-		execute(args)
+	var args []string
+	if flag.NArg() > 1 {
+		args = flag.Args()[1:]
 	}
+	logf("watching %s", watchPath)
+	logf("cmd: %s", args)
+
+	failed := make(chan error, 1)
+	w, err := dirwatch.New(func(err error) {
+		select {
+		case failed <- err:
+		default:
+		}
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer w.Close()
+
+	_, err = w.WatchTree(watchPath, time.Second, func(paths []string) {
+		logf("changed: %s", paths)
+		execute(args)
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatal(<-failed)
 }
 
 func logf(fmt string, args ...any) {

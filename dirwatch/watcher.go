@@ -1,3 +1,4 @@
+// Package dirwatch watches the changes of files and directory trees.
 package dirwatch
 
 import (
@@ -255,4 +256,22 @@ func (w *Watcher) takeDue(now time.Time) (calls []func(), next time.Time) {
 
 func isInside(dir, path string) bool {
 	return strings.HasPrefix(path, dir+string(filepath.Separator))
+}
+
+func collectWatchPaths(dir string) []string {
+	res := []string{dir}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return res
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && filterEntry(filepath.Base(entry.Name())) {
+			res = append(res, collectWatchPaths(filepath.Join(dir, entry.Name()))...)
+		}
+	}
+	return res
+}
+
+func filterEntry(name string) bool {
+	return !strings.HasPrefix(name, ".")
 }
