@@ -5,25 +5,35 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
+// Watch sends the paths changed in the directory tree p to signals, see Watcher.WatchTree:
+// the changes are grouped until there are none for a second. It blocks until the
+// underlying watcher fails, closing signals then, and returns the error.
 func Watch(p string, signals chan string) error {
-	w, err := fsnotify.NewWatcher()
+	failed := make(chan error, 1)
+	w, err := New(func(err error) {
+		select {
+		case failed <- err:
+		default:
+		}
+	})
 	if err != nil {
 		return err
 	}
 	defer w.Close()
 
-	for _, wp := range collectWatchPaths(p) {
-		if err := w.Add(wp); err != nil {
-			return err
+	stop, err := w.WatchTree(p, time.Second, func(paths []string) {
+		for _, path := range paths {
+			signals <- path
 		}
+	})
+	if err != nil {
+		return err
 	}
-
-	processEvents(w, signals)
-	return nil
+	defer close(signals)
+	defer stop()
+	return <-failed
 }
 
 func collectWatchPaths(dir string) []string {
@@ -38,39 +48,6 @@ func collectWatchPaths(dir string) []string {
 		}
 	}
 	return res
-}
-
-func processEvents(w *fsnotify.Watcher, out chan string) {
-	defer close(out)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	var changedPaths []string
-
-	for {
-		select {
-		case e := <-w.Events:
-			if e.Has(fsnotify.Write) || e.Has(fsnotify.Rename) || e.Has(fsnotify.Create) || e.Has(fsnotify.Remove) {
-				changedPaths = append(changedPaths, e.Name)
-			}
-			if e.Has(fsnotify.Create) {
-				fi, err := os.Stat(e.Name)
-				if err == nil && fi.IsDir() && filterEntry(filepath.Base(e.Name)) {
-					_ = w.Add(e.Name)
-				}
-			}
-		case <-w.Errors:
-			return
-
-		case <-ticker.C:
-			if len(changedPaths) > 0 {
-				for _, p := range changedPaths {
-					out <- p
-				}
-				changedPaths = changedPaths[:0]
-			}
-		}
-	}
 }
 
 func filterEntry(name string) bool {
