@@ -1,6 +1,7 @@
 package dirwatch
 
 import (
+	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -209,5 +210,23 @@ func TestWatcher_MissingDirectory(t *testing.T) {
 	}
 	if dirs := watchedDirs(w); len(dirs) != 0 {
 		t.Errorf("watching %v", dirs)
+	}
+}
+
+func TestWatcher_CloseTimeout(t *testing.T) {
+	prev := closeTimeout
+	closeTimeout = 10 * testDelay
+	t.Cleanup(func() { closeTimeout = prev })
+
+	w := newTestWatcher(t)
+	// Simulate the fsnotify watcher that never finishes closing.
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	w.closeFw = func() error {
+		<-block
+		return w.fw.Close()
+	}
+	if err := w.Close(); !errors.Is(err, errCloseTimeout) {
+		t.Errorf("Close = %v, want %v", err, errCloseTimeout)
 	}
 }

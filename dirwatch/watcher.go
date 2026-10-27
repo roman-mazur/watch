@@ -2,6 +2,7 @@
 package dirwatch
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,6 +21,7 @@ import (
 // the Watcher, after the events stop coming for the delay of the subscription.
 type Watcher struct {
 	fw      *fsnotify.Watcher
+	closeFw func() error // fw.Close, replaced in tests
 	onError func(error)
 
 	mu   sync.Mutex
@@ -48,6 +50,7 @@ func New(onError func(error)) (*Watcher, error) {
 	}
 	w := &Watcher{
 		fw:      fw,
+		closeFw: fw.Close,
 		onError: onError,
 		dirs:    make(map[string]int),
 	}
@@ -55,9 +58,26 @@ func New(onError func(error)) (*Watcher, error) {
 	return w, nil
 }
 
+// closeTimeout limits how long Close waits for the fsnotify watcher to stop.
+var closeTimeout = 5 * time.Second
+
+// errCloseTimeout is returned by Close when the fsnotify watcher does not stop in time.
+var errCloseTimeout = errors.New("dirwatch: timed out closing the watcher")
+
 // Close stops watching. The callback that is being called may still complete.
+//
+// On Windows, fsnotify (as of v1.10.1) loses the close request when it reports
+// an error at the same time, and its Close never returns. So Close gives up
+// after a timeout, leaving the fsnotify goroutines behind.
 func (w *Watcher) Close() error {
-	return w.fw.Close()
+	res := make(chan error, 1)
+	go func() { res <- w.closeFw() }()
+	select {
+	case err := <-res:
+		return err
+	case <-time.After(closeTimeout):
+		return errCloseTimeout
+	}
 }
 
 // WatchFile calls changed after the file is written, or created, for example, when
