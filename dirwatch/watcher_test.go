@@ -230,3 +230,72 @@ func TestWatcher_CloseTimeout(t *testing.T) {
 		t.Errorf("Close = %v, want %v", err, errCloseTimeout)
 	}
 }
+
+func TestWatcher_Dir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := filepath.Join(dir, "a.txt")
+	writeFile(t, existing, "a")
+	w := newTestWatcher(t)
+	changes := make(chan []string, 10)
+	stop, err := w.WatchDir(dir, testDelay, func(paths []string) { changes <- paths })
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectChange := func(t *testing.T, path string) {
+		t.Helper()
+		if got := waitFor(t, changes); !slices.Contains(got, path) {
+			t.Errorf("changed %v, want %s", got, path)
+		}
+	}
+
+	t.Run("create", func(t *testing.T) {
+		path := filepath.Join(dir, "b.txt")
+		writeFile(t, path, "b")
+		expectChange(t, path)
+	})
+
+	t.Run("write", func(t *testing.T) {
+		writeFile(t, existing, "changed")
+		expectNone(t, changes)
+	})
+
+	t.Run("subdirectory", func(t *testing.T) {
+		writeFile(t, filepath.Join(sub, "c.txt"), "c")
+		expectNone(t, changes)
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		renamed := filepath.Join(dir, "renamed.txt")
+		if err := os.Rename(existing, renamed); err != nil {
+			t.Fatal(err)
+		}
+		expectChange(t, renamed)
+	})
+
+	t.Run("remove", func(t *testing.T) {
+		path := filepath.Join(dir, "b.txt")
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		expectChange(t, path)
+	})
+
+	t.Run("stop", func(t *testing.T) {
+		stop()
+		writeFile(t, filepath.Join(dir, "d.txt"), "d")
+		expectNone(t, changes)
+		if dirs := watchedDirs(w); len(dirs) != 0 {
+			t.Errorf("still watching %v", dirs)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		if _, err := w.WatchDir(filepath.Join(dir, "missing"), testDelay, func([]string) {}); err == nil {
+			t.Error("watching a missing directory")
+		}
+	})
+}

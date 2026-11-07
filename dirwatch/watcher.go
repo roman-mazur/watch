@@ -30,8 +30,9 @@ type Watcher struct {
 }
 
 type subscription struct {
-	path    string // the file or the root of the tree
+	path    string // the file, the directory, or the root of the tree
 	tree    bool
+	dir     bool // the entries of the directory, not its subdirectories
 	delay   time.Duration
 	changed func(paths []string)
 	dirs    map[string]bool // the directories the subscription needs watched
@@ -115,6 +116,25 @@ func (w *Watcher) WatchTree(dir string, delay time.Duration, changed func(paths 
 		delay:   delay,
 		changed: changed,
 	}, collectWatchPaths(dir))
+}
+
+// WatchDir calls changed with the paths of the entries that were created, removed, or renamed
+// in the directory: the changes of its listing. The subdirectories are not watched, and
+// neither are the writes to the files.
+//
+// The callback may still be called once after stop returns, if the change was
+// detected before.
+func (w *Watcher) WatchDir(dir string, delay time.Duration, changed func(paths []string)) (stop func(), err error) {
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	return w.subscribe(&subscription{
+		path:    dir,
+		dir:     true,
+		delay:   delay,
+		changed: changed,
+	}, []string{dir})
 }
 
 func (w *Watcher) subscribe(s *subscription, dirs []string) (stop func(), err error) {
@@ -245,6 +265,10 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 }
 
 func (s *subscription) matches(name string, ev fsnotify.Event) bool {
+	if s.dir {
+		return filepath.Dir(name) == s.path &&
+			(ev.Has(fsnotify.Create) || ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename))
+	}
 	if !s.tree {
 		return name == s.path && (ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create))
 	}
