@@ -25,7 +25,8 @@ import (
 // a watched directory. A directory with more than 512 entries, or one that would take
 // the entries of the watched directories over 8192, is listed every 2 seconds instead:
 // its changes are reported later, and so are the writes of its files, detected by their
-// size and modification time.
+// size and modification time. A watched directory is polled from the moment it grows
+// over these limits.
 type Watcher struct {
 	fw      *fsnotify.Watcher
 	closeFw func() error // fw.Close, replaced in tests
@@ -241,6 +242,44 @@ func (w *Watcher) startDir(dir string) (*watchedDir, error) {
 	return &watchedDir{cost: cost}, nil
 }
 
+// trackCost counts the entries created and removed in a watched directory: fsnotify opens
+// and closes a file for each of them. The directory is polled from the moment it has more
+// entries than the threshold, or takes the cost of the watched directories over the budget.
+func (w *Watcher) trackCost(name string, ev fsnotify.Event) {
+	if w.poll.threshold <= 0 {
+		return
+	}
+	dir := filepath.Dir(name)
+	d := w.dirs[dir]
+	if d == nil || d.polled {
+		return
+	}
+	switch {
+	case ev.Has(fsnotify.Create):
+		d.cost++
+		w.cost++
+	case (ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename)) && d.cost > 1:
+		d.cost--
+		w.cost--
+	default:
+		return
+	}
+	if entries := d.cost - 1; entries > w.poll.threshold || w.cost > w.poll.budget {
+		w.startPolling(dir, d)
+	}
+}
+
+// startPolling polls the watched directory instead of watching it with fsnotify.
+func (w *Watcher) startPolling(dir string, d *watchedDir) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // Removed: it's going to be forgotten.
+	}
+	_ = w.fw.Remove(dir)
+	w.cost -= d.cost
+	d.polled, d.cost, d.listing = true, 0, readListing(dir, entries)
+}
+
 // releaseDir stops watching or polling the directory.
 func (w *Watcher) releaseDir(dir string) {
 	d := w.dirs[dir]
@@ -404,6 +443,7 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 	if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
 		w.forgetDir(name)
 	}
+	w.trackCost(name, ev)
 	for _, s := range w.subs {
 		if !s.matches(name, ev) {
 			continue

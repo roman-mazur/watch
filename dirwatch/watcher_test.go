@@ -467,3 +467,69 @@ func TestWatcher_PollTree(t *testing.T) {
 		}
 	})
 }
+
+func TestWatcher_PollGrowing(t *testing.T) {
+	t.Run("threshold", func(t *testing.T) {
+		dir := makeDir(t, t.TempDir(), 3)
+		w := newPollingWatcher(t, 3, 100)
+		changes := make(chan []string, 10)
+		if _, err := w.WatchDir(dir, testDelay, func(paths []string) { changes <- paths }); err != nil {
+			t.Fatal(err)
+		}
+		check := func(t *testing.T, wantPolled []string, wantCost int) {
+			t.Helper()
+			if polled, cost := polledDirs(w); !slices.Equal(polled, wantPolled) || cost != wantCost {
+				t.Errorf("polled %q with the cost %d, want %q with %d", polled, cost, wantPolled, wantCost)
+			}
+		}
+		check(t, nil, 4)
+
+		// The removed entries are counted too: the directory keeps 3 entries.
+		if err := os.Remove(filepath.Join(dir, "f0.txt")); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, changes)
+		writeFile(t, filepath.Join(dir, "a.txt"), "a")
+		waitFor(t, changes)
+		check(t, nil, 4)
+
+		writeFile(t, filepath.Join(dir, "b.txt"), "b")
+		waitFor(t, changes)
+		check(t, []string{dir}, 0)
+
+		// The changes are found by polling now.
+		path := filepath.Join(dir, "c.txt")
+		writeFile(t, path, "c")
+		if got := waitFor(t, changes); !slices.Contains(got, path) {
+			t.Errorf("changed %v, want %s", got, path)
+		}
+	})
+
+	t.Run("budget", func(t *testing.T) {
+		root := t.TempDir()
+		a := makeDir(t, filepath.Join(root, "a"), 3) // The cost of 4 with the directory itself.
+		b := makeDir(t, filepath.Join(root, "b"), 3)
+		w := newPollingWatcher(t, 100, 10)
+		changes := make(chan []string, 10)
+		for _, dir := range []string{a, b} {
+			if _, err := w.WatchDir(dir, testDelay, func(paths []string) { changes <- paths }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := range 3 {
+			writeFile(t, filepath.Join(b, fmt.Sprintf("new%d.txt", i)), "new")
+		}
+		// The new files may be reported in several groups.
+		var polled []string
+		var cost int
+		for range 50 {
+			waitFor(t, changes)
+			if polled, cost = polledDirs(w); len(polled) > 0 {
+				break
+			}
+		}
+		if !slices.Equal(polled, []string{b}) || cost != 4 {
+			t.Errorf("polled %q with the cost %d, want only %s with 4", polled, cost, b)
+		}
+	})
+}
