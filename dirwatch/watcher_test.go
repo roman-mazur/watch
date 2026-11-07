@@ -2,7 +2,7 @@ package dirwatch
 
 import (
 	"errors"
-	"maps"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -106,11 +106,28 @@ func TestWatcher_File(t *testing.T) {
 	})
 }
 
-// watchedDirs returns a copy of the watched directories with the subscriptions count.
+// watchedDirs returns the watched and polled directories with the subscriptions count.
 func watchedDirs(w *Watcher) map[string]int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return maps.Clone(w.dirs)
+	dirs := make(map[string]int, len(w.dirs))
+	for dir, d := range w.dirs {
+		dirs[dir] = d.subs
+	}
+	return dirs
+}
+
+// polledDirs returns the sorted polled directories and the cost of the watched ones.
+func polledDirs(w *Watcher) (polled []string, cost int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for dir, d := range w.dirs {
+		if d.polled {
+			polled = append(polled, dir)
+		}
+	}
+	slices.Sort(polled)
+	return polled, w.cost
 }
 
 func TestWatcher_SharedDirectory(t *testing.T) {
@@ -296,6 +313,157 @@ func TestWatcher_Dir(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		if _, err := w.WatchDir(filepath.Join(dir, "missing"), testDelay, func([]string) {}); err == nil {
 			t.Error("watching a missing directory")
+		}
+	})
+}
+
+func newPollingWatcher(t *testing.T, threshold, budget int) *Watcher {
+	t.Helper()
+	w, err := newWatcher(func(err error) { t.Errorf("watch error: %s", err) },
+		pollConfig{threshold: threshold, budget: budget, interval: testDelay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	return w
+}
+
+// makeDir creates a directory with the files f0.txt, f1.txt, ... in it.
+func makeDir(t *testing.T, dir string, files int) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range files {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%d.txt", i)), "0")
+	}
+	return dir
+}
+
+func TestWatcher_PollThreshold(t *testing.T) {
+	dir := makeDir(t, t.TempDir(), 4)
+	w := newPollingWatcher(t, 3, 100)
+	path := filepath.Join(dir, "f0.txt")
+	fileChanges, stopFile := watchFile(t, w, path)
+	dirChanges := make(chan []string, 10)
+	stopDir, err := w.WatchDir(dir, testDelay, func(paths []string) { dirChanges <- paths })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polled, cost := polledDirs(w); !slices.Equal(polled, []string{dir}) || cost != 0 {
+		t.Fatalf("polled %q with the cost %d, want only %s", polled, cost, dir)
+	}
+
+	t.Run("write", func(t *testing.T) {
+		writeFile(t, path, "11")
+		waitFor(t, fileChanges)
+		expectNone(t, dirChanges)
+	})
+
+	t.Run("replace", func(t *testing.T) {
+		tmp := filepath.Join(dir, "f0.tmp")
+		writeFile(t, tmp, "222")
+		if err := os.Rename(tmp, path); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, fileChanges)
+	})
+
+	t.Run("other file", func(t *testing.T) {
+		writeFile(t, filepath.Join(dir, "f1.txt"), "11")
+		expectNone(t, fileChanges)
+	})
+
+	t.Run("create and remove", func(t *testing.T) {
+		created := filepath.Join(dir, "new.txt")
+		writeFile(t, created, "new")
+		if got := waitFor(t, dirChanges); !slices.Contains(got, created) {
+			t.Errorf("changed %v, want %s", got, created)
+		}
+		if err := os.Remove(created); err != nil {
+			t.Fatal(err)
+		}
+		if got := waitFor(t, dirChanges); !slices.Contains(got, created) {
+			t.Errorf("changed %v, want %s", got, created)
+		}
+	})
+
+	t.Run("stop", func(t *testing.T) {
+		stopFile()
+		stopDir()
+		writeFile(t, path, "3333")
+		expectNone(t, fileChanges)
+		if dirs := watchedDirs(w); len(dirs) != 0 {
+			t.Errorf("still watching %v", dirs)
+		}
+	})
+}
+
+func TestWatcher_PollBudget(t *testing.T) {
+	root := t.TempDir()
+	a := makeDir(t, filepath.Join(root, "a"), 5) // The cost of 6 with the directory itself.
+	b := makeDir(t, filepath.Join(root, "b"), 5)
+	w := newPollingWatcher(t, 100, 10)
+	watch := func(dir string) func() {
+		t.Helper()
+		stop, err := w.WatchDir(dir, testDelay, func([]string) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stop
+	}
+	check := func(t *testing.T, wantPolled []string, wantCost int) {
+		t.Helper()
+		if polled, cost := polledDirs(w); !slices.Equal(polled, wantPolled) || cost != wantCost {
+			t.Errorf("polled %q with the cost %d, want %q with %d", polled, cost, wantPolled, wantCost)
+		}
+	}
+
+	stopA := watch(a)
+	stopB := watch(b)
+	check(t, []string{b}, 6)
+
+	stopA()
+	check(t, []string{b}, 0) // A directory keeps being polled.
+	stopB()
+	stopB = watch(b)
+	check(t, nil, 6)
+	stopB()
+	check(t, nil, 0)
+}
+
+func TestWatcher_PollTree(t *testing.T) {
+	root := t.TempDir()
+	sub := makeDir(t, filepath.Join(root, "sub"), 4)
+	w := newPollingWatcher(t, 3, 100)
+	changes := make(chan []string, 10)
+	if _, err := w.WatchTree(root, testDelay, func(paths []string) { changes <- paths }); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("new directory in a polled one", func(t *testing.T) {
+		dir := filepath.Join(sub, "new")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, changes)
+		path := filepath.Join(dir, "a.txt")
+		writeFile(t, path, "a")
+		if got := waitFor(t, changes); !slices.Contains(got, path) {
+			t.Errorf("changed %v, want %s", got, path)
+		}
+	})
+
+	t.Run("polled directory removed", func(t *testing.T) {
+		if err := os.RemoveAll(sub); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, changes)
+		if polled, _ := polledDirs(w); len(polled) != 0 {
+			t.Errorf("still polling %q", polled)
+		}
+		if dirs := watchedDirs(w); len(dirs) != 1 {
+			t.Errorf("watching %v, want only the root", dirs)
 		}
 	})
 }

@@ -3,6 +3,7 @@ package dirwatch
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,14 +20,45 @@ import (
 //
 // The callbacks of the subscriptions are called one at a time on the goroutine of
 // the Watcher, after the events stop coming for the delay of the subscription.
+//
+// On macOS and BSD, fsnotify uses kqueue, which keeps a file open for every entry of
+// a watched directory. A directory with more than 512 entries, or one that would take
+// the entries of the watched directories over 8192, is listed every 2 seconds instead:
+// its changes are reported later, and so are the writes of its files, detected by their
+// size and modification time.
 type Watcher struct {
 	fw      *fsnotify.Watcher
 	closeFw func() error // fw.Close, replaced in tests
 	onError func(error)
+	poll    pollConfig
 
 	mu   sync.Mutex
-	dirs map[string]int // watched directories with the number of subscriptions using them
+	dirs map[string]*watchedDir // the directories the subscriptions need
+	cost int                    // the open files taken by the watched directories, see pollConfig
 	subs []*subscription
+}
+
+// pollConfig selects the directories to poll instead of watching them with fsnotify.
+type pollConfig struct {
+	threshold int // poll the directories with more entries, never poll if zero
+	budget    int // poll the directories taking the cost of the watched ones over it
+	interval  time.Duration
+}
+
+// watchedDir is a directory needed by the subscriptions.
+type watchedDir struct {
+	subs int // the subscriptions using it
+
+	polled  bool
+	cost    int              // the open files the fsnotify watch takes: the entries and the directory
+	listing map[string]entry // the entries found when the polled directory was listed last time
+}
+
+// entry is the state of a directory entry compared by polling.
+type entry struct {
+	dir     bool
+	size    int64
+	modTime time.Time
 }
 
 type subscription struct {
@@ -45,6 +77,14 @@ type subscription struct {
 // New starts a Watcher. The errors of the underlying watcher are passed to onError,
 // which may be nil.
 func New(onError func(error)) (*Watcher, error) {
+	return newWatcher(onError, pollConfig{
+		threshold: defaultPollThreshold,
+		budget:    defaultPollBudget,
+		interval:  2 * time.Second,
+	})
+}
+
+func newWatcher(onError func(error), poll pollConfig) (*Watcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -53,7 +93,8 @@ func New(onError func(error)) (*Watcher, error) {
 		fw:      fw,
 		closeFw: fw.Close,
 		onError: onError,
-		dirs:    make(map[string]int),
+		poll:    poll,
+		dirs:    make(map[string]*watchedDir),
 	}
 	go w.run()
 	return w, nil
@@ -167,23 +208,56 @@ func (w *Watcher) addDir(s *subscription, dir string) error {
 	if s.dirs[dir] {
 		return nil
 	}
-	if w.dirs[dir] == 0 {
-		if err := w.fw.Add(dir); err != nil {
+	d := w.dirs[dir]
+	if d == nil {
+		var err error
+		if d, err = w.startDir(dir); err != nil {
 			return err
 		}
+		w.dirs[dir] = d
 	}
-	w.dirs[dir]++
+	d.subs++
 	s.dirs[dir] = true
 	return nil
+}
+
+// startDir watches the directory with fsnotify, or starts polling it if it has too many entries.
+func (w *Watcher) startDir(dir string) (*watchedDir, error) {
+	if w.poll.threshold <= 0 {
+		return &watchedDir{}, w.fw.Add(dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	cost := len(entries) + 1
+	if len(entries) > w.poll.threshold || w.cost+cost > w.poll.budget {
+		return &watchedDir{polled: true, listing: readListing(dir, entries)}, nil
+	}
+	if err := w.fw.Add(dir); err != nil {
+		return nil, err
+	}
+	w.cost += cost
+	return &watchedDir{cost: cost}, nil
+}
+
+// releaseDir stops watching or polling the directory.
+func (w *Watcher) releaseDir(dir string) {
+	d := w.dirs[dir]
+	delete(w.dirs, dir)
+	if !d.polled {
+		_ = w.fw.Remove(dir) // It may be removed by fsnotify already.
+		w.cost -= d.cost
+	}
 }
 
 // removeDirs stops watching the directories of the subscription that no other one needs.
 func (w *Watcher) removeDirs(s *subscription) {
 	for dir := range s.dirs {
-		w.dirs[dir]--
-		if w.dirs[dir] <= 0 {
-			delete(w.dirs, dir)
-			_ = w.fw.Remove(dir)
+		if d := w.dirs[dir]; d != nil {
+			if d.subs--; d.subs <= 0 {
+				w.releaseDir(dir)
+			}
 		}
 	}
 	clear(s.dirs)
@@ -196,8 +270,7 @@ func (w *Watcher) forgetDir(dir string) {
 	}
 	for d := range w.dirs {
 		if d == dir || isInside(dir, d) {
-			delete(w.dirs, d)
-			_ = w.fw.Remove(d) // It may be removed by fsnotify already.
+			w.releaseDir(d)
 			for _, s := range w.subs {
 				delete(s.dirs, d)
 			}
@@ -205,9 +278,93 @@ func (w *Watcher) forgetDir(dir string) {
 	}
 }
 
+// pollDirs lists the polled directories and handles their changes since the last listing
+// as the events of fsnotify.
+func (w *Watcher) pollDirs() {
+	w.mu.Lock()
+	var dirs []string
+	for dir, d := range w.dirs {
+		if d.polled {
+			dirs = append(dirs, dir)
+		}
+	}
+	w.mu.Unlock()
+
+	var events []fsnotify.Event
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			events = append(events, fsnotify.Event{Name: dir, Op: fsnotify.Remove})
+			continue
+		} else if err != nil {
+			continue // Try again next time.
+		}
+		listing := readListing(dir, entries)
+
+		w.mu.Lock()
+		if d := w.dirs[dir]; d != nil && d.polled { // It may be released in the meantime.
+			events = append(events, listingChanges(dir, d.listing, listing)...)
+			d.listing = listing
+		}
+		w.mu.Unlock()
+	}
+	for _, ev := range events {
+		w.handle(ev)
+	}
+}
+
+func readListing(dir string, entries []fs.DirEntry) map[string]entry {
+	listing := make(map[string]entry, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			listing[e.Name()] = entry{dir: true}
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // Removed already.
+		}
+		listing[e.Name()] = entry{size: info.Size(), modTime: info.ModTime()}
+	}
+	return listing
+}
+
+// listingChanges returns the events for the differences between the listings of the directory.
+func listingChanges(dir string, prev, cur map[string]entry) []fsnotify.Event {
+	var events []fsnotify.Event
+	add := func(name string, op fsnotify.Op) {
+		events = append(events, fsnotify.Event{Name: filepath.Join(dir, name), Op: op})
+	}
+	for name, e := range cur {
+		p, existed := prev[name]
+		switch {
+		case !existed:
+			add(name, fsnotify.Create)
+		case p.dir != e.dir:
+			add(name, fsnotify.Remove)
+			add(name, fsnotify.Create)
+		case !e.dir && (p.size != e.size || !p.modTime.Equal(e.modTime)):
+			add(name, fsnotify.Write)
+		}
+	}
+	for name := range prev {
+		if _, exists := cur[name]; !exists {
+			add(name, fsnotify.Remove)
+		}
+	}
+	slices.SortFunc(events, func(a, b fsnotify.Event) int { return strings.Compare(a.Name, b.Name) })
+	return events
+}
+
 func (w *Watcher) run() {
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
+	var tick <-chan time.Time
+	if w.poll.threshold > 0 {
+		ticker := time.NewTicker(w.poll.interval)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
 	for {
 		select {
 		case ev, ok := <-w.fw.Events:
@@ -223,6 +380,8 @@ func (w *Watcher) run() {
 				w.onError(err)
 			}
 		case <-timer.C:
+		case <-tick:
+			w.pollDirs()
 		}
 
 		calls, next := w.takeDue(time.Now())
